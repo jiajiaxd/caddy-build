@@ -1,0 +1,123 @@
+name: Build Caddy and publish to GHCR
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+      timezone: "Asia/Shanghai"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set image name
+        id: image
+        run: |
+          IMAGE_NAME="${REGISTRY}/${GITHUB_REPOSITORY}"
+          echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build candidate image for update check
+        run: |
+          docker build --pull --no-cache -t caddy-candidate:latest .
+
+      - name: Compare with current GHCR image
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.image.outputs.name }}:latest"
+
+          mkdir -p /tmp/caddy-check
+
+          NEW_CONTAINER="$(docker create caddy-candidate:latest)"
+          docker cp "$NEW_CONTAINER:/usr/bin/caddy" /tmp/caddy-check/caddy-new
+          docker rm "$NEW_CONTAINER"
+
+          go version -m /tmp/caddy-check/caddy-new \
+            | sed 's#/tmp/caddy-check/caddy-new#caddy#' \
+            > /tmp/caddy-check/new.txt
+
+          if docker pull "$IMAGE"; then
+            OLD_CONTAINER="$(docker create "$IMAGE")"
+            docker cp "$OLD_CONTAINER:/usr/bin/caddy" /tmp/caddy-check/caddy-old
+            docker rm "$OLD_CONTAINER"
+
+            go version -m /tmp/caddy-check/caddy-old \
+              | sed 's#/tmp/caddy-check/caddy-old#caddy#' \
+              > /tmp/caddy-check/old.txt
+
+            if cmp -s /tmp/caddy-check/old.txt /tmp/caddy-check/new.txt; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "No Caddy/module update found."
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              echo "Caddy/module update found:"
+              diff -u /tmp/caddy-check/old.txt /tmp/caddy-check/new.txt || true
+            fi
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No existing GHCR image found, will publish first image."
+          fi
+
+      - name: Set up QEMU
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.compare.outputs.changed == 'true')
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.compare.outputs.changed == 'true')
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.compare.outputs.changed == 'true')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          pull: true
+          no-cache: true
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Skip publish
+        if: github.event_name == 'schedule' && steps.compare.outputs.changed == 'false'
+        run: |
+          echo "No upstream Caddy/plugin/module update detected. Skip publishing."
