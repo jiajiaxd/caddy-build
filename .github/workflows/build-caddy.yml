@@ -3,18 +3,16 @@ name: Build Caddy and publish to GHCR
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 4 * * *"
-      timezone: "Asia/Shanghai"
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
-  pull_request:
+    # 04:00 Asia/Shanghai
+    - cron: "0 20 * * *"
 
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -52,60 +50,95 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build candidate image for update check
-        run: |
-          docker build --pull --no-cache -t caddy-candidate:latest .
-
-      - name: Compare with current GHCR image
-        id: compare
+      - name: Check latest Caddy and plugin versions
+        id: update_check
         shell: bash
         run: |
           set -euo pipefail
 
           IMAGE="${{ steps.image.outputs.name }}:latest"
+          CHECK_DIR="/tmp/caddy-check"
 
-          mkdir -p /tmp/caddy-check
+          mkdir -p "$CHECK_DIR"
 
-          NEW_CONTAINER="$(docker create caddy-candidate:latest)"
-          docker cp "$NEW_CONTAINER:/usr/bin/caddy" /tmp/caddy-check/caddy-new
-          docker rm "$NEW_CONTAINER"
+          mapfile -t PLUGINS < <(
+            awk '
+              /--with([=[:space:]]|$)/ {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "--with" && (i + 1) <= NF) {
+                    print $(i + 1)
+                  } else if ($i ~ /^--with=/) {
+                    sub(/^--with=/, "", $i)
+                    print $i
+                  }
+                }
+              }
+            ' Dockerfile | sed 's/\\$//' | sed '/^$/d'
+          )
 
-          go version -m /tmp/caddy-check/caddy-new \
-            | sed 's#/tmp/caddy-check/caddy-new#caddy#' \
-            > /tmp/caddy-check/new.txt
+          QUERY_MODULES=("github.com/caddyserver/caddy/v2@latest")
+          for plugin in "${PLUGINS[@]}"; do
+            if [[ "$plugin" == *@* ]]; then
+              QUERY_MODULES+=("$plugin")
+            else
+              QUERY_MODULES+=("${plugin}@latest")
+            fi
+          done
+
+          docker pull caddy:builder
+
+          docker run --rm caddy:builder \
+            go list -m -f '{{.Path}} {{.Version}}' "${QUERY_MODULES[@]}" \
+            | sort -u > "$CHECK_DIR/latest.txt"
+
+          echo "Latest requested modules:"
+          cat "$CHECK_DIR/latest.txt"
 
           if docker pull "$IMAGE"; then
             OLD_CONTAINER="$(docker create "$IMAGE")"
-            docker cp "$OLD_CONTAINER:/usr/bin/caddy" /tmp/caddy-check/caddy-old
+            docker cp "$OLD_CONTAINER:/usr/bin/caddy" "$CHECK_DIR/caddy-old"
             docker rm "$OLD_CONTAINER"
 
-            go version -m /tmp/caddy-check/caddy-old \
-              | sed 's#/tmp/caddy-check/caddy-old#caddy#' \
-              > /tmp/caddy-check/old.txt
+            docker run --rm -v "$CHECK_DIR:/work" caddy:builder \
+              go version -m /work/caddy-old > "$CHECK_DIR/old-all.txt"
 
-            if cmp -s /tmp/caddy-check/old.txt /tmp/caddy-check/new.txt; then
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              echo "No Caddy/module update found."
+            : > "$CHECK_DIR/current.txt"
+            while read -r path version; do
+              awk -v path="$path" '
+                ($1 == "mod" || $1 == "dep") && $2 == path {
+                  print $2, $3
+                }
+              ' "$CHECK_DIR/old-all.txt" >> "$CHECK_DIR/current.txt"
+            done < "$CHECK_DIR/latest.txt"
+
+            sort -u -o "$CHECK_DIR/current.txt" "$CHECK_DIR/current.txt"
+
+            echo "Current published modules:"
+            cat "$CHECK_DIR/current.txt"
+
+            if cmp -s "$CHECK_DIR/current.txt" "$CHECK_DIR/latest.txt"; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "Current GHCR image already contains the latest requested Caddy/plugin versions."
             else
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-              echo "Caddy/module update found:"
-              diff -u /tmp/caddy-check/old.txt /tmp/caddy-check/new.txt || true
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              echo "Caddy/plugin update found:"
+              diff -u "$CHECK_DIR/current.txt" "$CHECK_DIR/latest.txt" || true
             fi
           else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "No existing GHCR image found, will publish first image."
           fi
 
       - name: Set up QEMU
-        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.compare.outputs.changed == 'true')
+        if: github.event_name != 'pull_request' && steps.update_check.outputs.should_build == 'true'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.compare.outputs.changed == 'true')
+        if: github.event_name != 'pull_request' && steps.update_check.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Build and push
-        if: github.event_name != 'pull_request' && (github.event_name != 'schedule' || steps.compare.outputs.changed == 'true')
+        if: github.event_name != 'pull_request' && steps.update_check.outputs.should_build == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -118,6 +151,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Skip publish
-        if: github.event_name == 'schedule' && steps.compare.outputs.changed == 'false'
+        if: steps.update_check.outputs.should_build == 'false'
         run: |
-          echo "No upstream Caddy/plugin/module update detected. Skip publishing."
+          echo "Current GHCR image already contains the latest requested Caddy/plugin versions. Skip publishing."
