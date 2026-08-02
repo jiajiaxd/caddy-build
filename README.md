@@ -18,6 +18,7 @@ docker pull ghcr.io/jiajiaxd/caddy-build:latest
 
 ## 已包含插件
 
+- `github.com/caddy-dns/alidns`
 - `github.com/caddy-dns/cloudflare`
 - `github.com/caddy-dns/tencentcloud`
 
@@ -70,6 +71,7 @@ docker run --rm ghcr.io/jiajiaxd/caddy-build:latest caddy list-modules | grep dn
 
 ```text
 dns.providers.cloudflare
+dns.providers.alidns
 dns.providers.tencentcloud
 ```
 
@@ -94,6 +96,21 @@ Cloudflare DNS-01 示例：
 example.com {
 	tls {
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	respond "Hello from Caddy"
+}
+```
+
+阿里云 DNS-01 示例：
+
+```caddyfile
+example.com {
+	tls {
+		dns alidns {
+			access_key_id {env.ALICLOUD_ACCESS_KEY_ID}
+			access_key_secret {env.ALICLOUD_ACCESS_KEY_SECRET}
+		}
 	}
 
 	respond "Hello from Caddy"
