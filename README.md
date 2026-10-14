@@ -4,6 +4,8 @@
 
 当前镜像基于官方 `caddy:builder` 使用 `xcaddy` 编译 Caddy，并在最终镜像中替换官方 `caddy:latest` 的 `/usr/bin/caddy`。
 
+同时会把镜像中的 Caddy 二进制发布到 GitHub Release，方便不使用 Docker 的场景。
+
 ## 镜像地址
 
 ```text
@@ -14,6 +16,24 @@ ghcr.io/jiajiaxd/caddy-build
 
 ```bash
 docker pull ghcr.io/jiajiaxd/caddy-build:latest
+```
+
+## 二进制下载
+
+在 [Releases](https://github.com/jiajiaxd/caddy-build/releases) 页面下载对应架构的压缩包，二进制与同次发布的 Docker 镜像完全一致：
+
+- `caddy_<版本>_linux_amd64.tar.gz`
+- `caddy_<版本>_linux_arm64.tar.gz`
+- `checksums.txt`：SHA-256 校验和
+
+Release 标签格式为 `<Caddy 版本>-<构建日期>`，例如 `v2.11.7-20261006`。
+
+```bash
+gh release download --repo jiajiaxd/caddy-build \
+  --pattern 'caddy_*_linux_amd64.tar.gz' --pattern checksums.txt
+sha256sum -c --ignore-missing checksums.txt
+tar -xzf caddy_*_linux_amd64.tar.gz
+sudo install -m 755 caddy /usr/local/bin/caddy
 ```
 
 ## 已包含插件
@@ -30,25 +50,21 @@ docker pull ghcr.io/jiajiaxd/caddy-build:latest
 
 触发条件：
 
-- 推送到 `main` 分支
-- 推送 `v*` 标签
 - 每天北京时间 04:00 定时检查
 - 手动触发 `workflow_dispatch`
-- Pull Request 会构建候选镜像用于检查，但不会推送到 GHCR
 
 发布平台：
 
 - `linux/amd64`
 - `linux/arm64`
 
-标签规则：
+镜像标签：
 
-- `latest`：默认分支构建
+- `latest`：最新构建
 - `main`：`main` 分支构建
-- `v*`：Git 标签构建，例如 `v1.0.0`
 - `sha-*`：按提交 SHA 生成的镜像标签
 
-定时任务会先构建候选镜像，并与 GHCR 上已有的 `latest` 镜像比较 Caddy 二进制的 Go module 信息；如果 Caddy 或插件没有变化，则跳过发布。
+每次运行会先查询 Caddy 和插件的最新版本，并与 GHCR 上 `latest` 镜像中 Caddy 二进制的 Go module 信息比较；如果没有变化则跳过发布。有变化时会构建并推送镜像，再用 `scripts/package-release.sh` 从刚推送的镜像中取出各架构的二进制，打包后发布到 GitHub Release。
 
 ## 本地调试构建
 
@@ -156,4 +172,4 @@ RUN xcaddy build \
     --with github.com/caddy-dns/tencentcloud
 ```
 
-修改后推送到 `main` 分支即可由 GitHub Actions 自动构建并发布到 GHCR。需要先本地验证时，可以使用 `docker build -t caddy-custom:latest .`。
+修改后推送到 `main` 分支，再手动触发 workflow（或等待每日定时任务）即可构建并发布到 GHCR 和 GitHub Release。需要先本地验证时，可以使用 `docker build -t caddy-custom:latest .`。
